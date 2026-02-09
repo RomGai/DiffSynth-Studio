@@ -19,6 +19,7 @@ from ..models.qwen_image_controlnet import QwenImageBlockWiseControlNet
 from ..models.siglip2_image_encoder import Siglip2ImageEncoder
 from ..models.dinov3_image_encoder import DINOv3ImageEncoder
 from ..models.qwen_image_image2lora import QwenImageImage2LoRAModel
+from ..models.qwen3_connector import Qwen3Connector
 
 
 class QwenImagePipeline(BasePipeline):
@@ -42,7 +43,9 @@ class QwenImagePipeline(BasePipeline):
         self.image2lora_coarse: QwenImageImage2LoRAModel = None
         self.image2lora_fine: QwenImageImage2LoRAModel = None
         self.processor: Qwen2VLProcessor = None
-        self.in_iteration_models = ("dit", "blockwise_controlnet")
+        self.qwen3_pipeline = None
+        self.qwen3_connector: Qwen3Connector = None
+        self.in_iteration_models = ("dit", "blockwise_controlnet", "qwen3_connector")
         self.units = [
             QwenImageUnit_ShapeChecker(),
             QwenImageUnit_NoiseInitializer(),
@@ -51,6 +54,7 @@ class QwenImagePipeline(BasePipeline):
             QwenImageUnit_EditImageEmbedder(),
             QwenImageUnit_LayerInputImageEmbedder(),
             QwenImageUnit_ContextImageEmbedder(),
+            QwenImageUnit_Qwen3Condition(),
             QwenImageUnit_PromptEmbedder(),
             QwenImageUnit_EntityControl(),
             QwenImageUnit_BlockwiseControlNet(),
@@ -135,6 +139,9 @@ class QwenImagePipeline(BasePipeline):
         layer_num: int = None,
         # In-context control
         context_image: Image.Image = None,
+        # Qwen3-VL conditioning
+        qwen3_history: list[dict] | None = None,
+        qwen3_history_json: str | None = None,
         # Tile
         tiled: bool = False,
         tile_size: int = 128,
@@ -167,6 +174,9 @@ class QwenImagePipeline(BasePipeline):
             "zero_cond_t": zero_cond_t,
             "layer_input_image": layer_input_image,
             "layer_num": layer_num,
+            "qwen3_history": qwen3_history,
+            "qwen3_history_json": qwen3_history_json,
+            "use_qwen3_conditioning": qwen3_history is not None or qwen3_history_json is not None,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -193,6 +203,17 @@ class QwenImagePipeline(BasePipeline):
         self.load_models_to_device([])
 
         return image
+
+    def enable_qwen3_conditioning(self, config=None, connector_kwargs=None):
+        if self.qwen3_pipeline is None:
+            from qwen3_pipeline import Qwen3VLDiffusionPipeline, Qwen3VLPipelineConfig
+            self.qwen3_pipeline = Qwen3VLDiffusionPipeline(config or Qwen3VLPipelineConfig())
+        if self.qwen3_connector is None:
+            kwargs = connector_kwargs or {}
+            self.qwen3_connector = Qwen3Connector(**kwargs).to(
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
 
 
 class QwenImageBlockwiseMultiControlNet(torch.nn.Module):
@@ -323,7 +344,7 @@ class QwenImageUnit_PromptEmbedder(PipelineUnit):
             seperate_cfg=True,
             input_params_posi={"prompt": "prompt"},
             input_params_nega={"prompt": "negative_prompt"},
-            input_params=("edit_image",),
+            input_params=("edit_image", "use_qwen3_conditioning"),
             output_params=("prompt_emb", "prompt_emb_mask"),
             onload_model_names=("text_encoder",)
         )
@@ -381,7 +402,9 @@ class QwenImageUnit_PromptEmbedder(PipelineUnit):
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
         return split_hidden_states
 
-    def process(self, pipe: QwenImagePipeline, prompt, edit_image=None) -> dict:
+    def process(self, pipe: QwenImagePipeline, prompt, edit_image=None, use_qwen3_conditioning=False) -> dict:
+        if use_qwen3_conditioning:
+            return {}
         pipe.load_models_to_device(self.onload_model_names)
         if pipe.text_encoder is not None:
             prompt = [prompt]
@@ -696,9 +719,54 @@ class QwenImageUnit_ContextImageEmbedder(PipelineUnit):
         return {"context_latents": context_latents}
 
 
+class QwenImageUnit_Qwen3Condition(PipelineUnit):
+    def __init__(self):
+        super().__init__(
+            take_over=True,
+            input_params=("qwen3_history", "qwen3_history_json", "cfg_scale"),
+            output_params=("qwen3_llm_embedding", "qwen3_mask"),
+            onload_model_names=("qwen3_connector",),
+        )
+
+    def _normalize_history(self, history):
+        normalized = []
+        for item in history:
+            image = item["image"]
+            if isinstance(image, str):
+                image = Image.open(image).convert("RGB")
+            normalized.append({"image": image, "description": item["description"]})
+        return normalized
+
+    def process(self, pipe: QwenImagePipeline, inputs_shared: dict, inputs_posi: dict, inputs_nega: dict):
+        history = inputs_shared.get("qwen3_history")
+        history_json = inputs_shared.get("qwen3_history_json")
+        if history is None and history_json is None:
+            inputs_shared["use_qwen3_conditioning"] = False
+            return inputs_shared, inputs_posi, inputs_nega
+
+        inputs_shared["use_qwen3_conditioning"] = True
+        pipe.enable_qwen3_conditioning()
+
+        if history_json is not None:
+            history = pipe.qwen3_pipeline.load_sample_history(history_json)
+        else:
+            history = self._normalize_history(history)
+
+        llm_embeddings, llm_masks = pipe.qwen3_pipeline.encode(history)
+        llm_embeddings = llm_embeddings.to(device=pipe.device, dtype=pipe.torch_dtype)
+        llm_masks = llm_masks.to(device=pipe.device)
+        inputs_posi.update({"qwen3_llm_embedding": llm_embeddings, "qwen3_mask": llm_masks})
+        if inputs_shared.get("cfg_scale", 1) != 1:
+            inputs_nega.update({
+                "qwen3_llm_embedding": torch.zeros_like(llm_embeddings),
+                "qwen3_mask": llm_masks,
+            })
+        return inputs_shared, inputs_posi, inputs_nega
+
 def model_fn_qwen_image(
     dit: QwenImageDiT = None,
     blockwise_controlnet: QwenImageBlockwiseMultiControlNet = None,
+    qwen3_connector: Qwen3Connector = None,
     latents=None,
     timestep=None,
     prompt_emb=None,
@@ -721,8 +789,17 @@ def model_fn_qwen_image(
     use_gradient_checkpointing_offload=False,
     edit_rope_interpolation=False,
     zero_cond_t=False,
+    qwen3_llm_embedding=None,
+    qwen3_mask=None,
     **kwargs
 ):
+    if qwen3_llm_embedding is not None:
+        if qwen3_connector is None:
+            raise ValueError("qwen3_connector is required when qwen3_llm_embedding is provided.")
+        prompt_emb, _ = qwen3_connector(qwen3_llm_embedding, timestep / 1000, qwen3_mask)
+        prompt_emb_mask = qwen3_mask
+    if prompt_emb is None or prompt_emb_mask is None:
+        raise ValueError("prompt_emb and prompt_emb_mask must be provided for Qwen-Image generation.")
     if layer_num is None:
         layer_num = 1
         img_shapes = [(1, latents.shape[2]//2, latents.shape[3]//2)]
