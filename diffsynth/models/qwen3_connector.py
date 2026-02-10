@@ -38,20 +38,21 @@ class Qwen3TokenRefiner(nn.Module):
         t: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = self.input_proj(x)
+        x_input = x
+        x = self.input_proj(x_input)
         if mask is not None:
             key_padding_mask = mask == 0
         else:
             key_padding_mask = None
 
         if mask is None:
-            pooled = x.mean(dim=1)
+            pooled = x_input.mean(dim=1)
         else:
-            mask_float = mask.unsqueeze(-1).to(x.dtype)
-            pooled = (x * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
+            mask_float = mask.unsqueeze(-1).to(dtype=x_input.dtype, device=x_input.device)
+            pooled = (x_input * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
         context = self.context_proj(pooled)
 
-        time_input = t.float().view(-1, 1)
+        time_input = t.to(dtype=x.dtype, device=x.device).view(-1, 1)
         time_embed = self.time_mlp(time_input)
 
         x = x + (context + time_embed).unsqueeze(1)
