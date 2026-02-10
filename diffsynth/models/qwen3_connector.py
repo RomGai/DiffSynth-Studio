@@ -89,7 +89,7 @@ class Qwen3Connector(nn.Module):
         t: torch.LongTensor,
         mask: Optional[torch.LongTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        mask_float = mask.unsqueeze(-1) if mask is not None else None
+        mask_float = mask.unsqueeze(-1).to(dtype=x.dtype, device=x.device) if mask is not None else None
         if mask_float is None:
             x_mean = x.mean(dim=1)
         else:
