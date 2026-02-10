@@ -1,20 +1,91 @@
-import torch, os, argparse, accelerate
-from diffsynth.core import UnifiedDataset
-from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
+import argparse
+import json
+import os
+from pathlib import Path
+
+import accelerate
+import torch
+from PIL import Image
+
+from diffsynth.core.data.operators import ImageCropAndResize
 from diffsynth.diffusion import *
-from diffsynth.core.data.operators import *
+from diffsynth.diffusion.parsers import (
+    add_gradient_config,
+    add_image_size_config,
+    add_lora_config,
+    add_model_config,
+    add_output_config,
+    add_training_config,
+)
+from diffsynth.pipelines.qwen_image import ModelConfig, QwenImagePipeline
 from qwen3_pipeline import Qwen3VLPipelineConfig
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+class SampleHistoryDataset(torch.utils.data.Dataset):
+    """Training dataset built directly from sample_history.json."""
+
+    def __init__(
+        self,
+        sample_history_json: str,
+        repeat: int = 1,
+        max_pixels: int = 1024 * 1024,
+        height: int | None = None,
+        width: int | None = None,
+        prompt_mode: str = "description",
+    ):
+        self.sample_history_json = str(sample_history_json)
+        self.repeat = repeat
+        self.load_from_cache = False
+        self.prompt_mode = prompt_mode
+
+        history_path = Path(sample_history_json)
+        with history_path.open("r", encoding="utf-8") as handle:
+            records = json.load(handle)
+        if not isinstance(records, list) or len(records) == 0:
+            raise ValueError("sample_history.json must be a non-empty list.")
+
+        self.items = []
+        image_processor = ImageCropAndResize(height, width, max_pixels, 16, 16)
+        for record in records:
+            image_path = record.get("image")
+            description = record.get("description", "")
+            if image_path is None:
+                raise ValueError("Each record in sample_history.json must contain an 'image' field.")
+            image_file = Path(image_path)
+            if not image_file.is_absolute():
+                image_file = history_path.parent / image_file
+            image = Image.open(image_file).convert("RGB")
+            image = image_processor(image)
+            prompt = description if prompt_mode == "description" else ""
+            self.items.append({
+                "image": image,
+                "prompt": prompt,
+                "qwen3_history_json": self.sample_history_json,
+            })
+
+    def __len__(self):
+        return len(self.items) * self.repeat
+
+    def __getitem__(self, idx):
+        return self.items[idx % len(self.items)]
 
 
 class Qwen3VLMTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
-        model_paths=None, model_id_with_origin_paths=None,
-        tokenizer_path=None, processor_path=None,
+        model_paths=None,
+        model_id_with_origin_paths=None,
+        tokenizer_path=None,
+        processor_path=None,
         trainable_models=None,
-        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
-        preset_lora_path=None, preset_lora_model=None,
+        lora_base_model=None,
+        lora_target_modules="",
+        lora_rank=32,
+        lora_checkpoint=None,
+        preset_lora_path=None,
+        preset_lora_model=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
@@ -37,7 +108,13 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
         )
         tokenizer_config = ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="tokenizer/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         processor_config = ModelConfig(model_id="Qwen/Qwen-Image-Edit", origin_file_pattern="processor/") if processor_path is None else ModelConfig(processor_path)
-        self.pipe = QwenImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, processor_config=processor_config)
+        self.pipe = QwenImagePipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            processor_config=processor_config,
+        )
         qwen3_config = Qwen3VLPipelineConfig(
             model_name_or_path=qwen3_model_name_or_path or Qwen3VLPipelineConfig.model_name_or_path,
             max_length=qwen3_max_length,
@@ -49,9 +126,14 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
 
         self.switch_pipe_to_training_mode(
-            self.pipe, trainable_models,
-            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
-            preset_lora_path, preset_lora_model,
+            self.pipe,
+            trainable_models,
+            lora_base_model,
+            lora_target_modules,
+            lora_rank,
+            lora_checkpoint,
+            preset_lora_path,
+            preset_lora_model,
             task=task,
         )
 
@@ -71,7 +153,7 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
         }
 
     def get_pipeline_inputs(self, data):
-        inputs_posi = {"prompt": data["prompt"]}
+        inputs_posi = {"prompt": data.get("prompt", "")}
         inputs_nega = {"negative_prompt": ""}
         inputs_shared = {
             "cfg_scale": 1,
@@ -80,26 +162,20 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
             "edit_image_auto_resize": True,
             "zero_cond_t": self.zero_cond_t,
-            "qwen3_history": data.get("qwen3_history"),
             "qwen3_history_json": data.get("qwen3_history_json"),
         }
-        if isinstance(data["image"], list):
-            inputs_shared.update({
-                "input_image": data["image"],
-                "height": data["image"][0].size[1],
-                "width": data["image"][0].size[0],
-            })
-        else:
-            inputs_shared.update({
-                "input_image": data["image"],
-                "height": data["image"].size[1],
-                "width": data["image"].size[0],
-            })
+        image = data["image"]
+        inputs_shared.update({
+            "input_image": image,
+            "height": image.size[1],
+            "width": image.size[0],
+        })
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
-        if inputs is None: inputs = self.get_pipeline_inputs(data)
+        if inputs is None:
+            inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
@@ -108,9 +184,21 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
 
 
 def qwen3_vlm_parser():
-    parser = argparse.ArgumentParser(description="Training script for Qwen3-VL conditioning with Qwen-Image DiT.")
-    parser = add_general_config(parser)
+    parser = argparse.ArgumentParser(
+        description="Training script for Qwen3-VL conditioning with Qwen-Image DiT using sample_history.json as the primary data source."
+    )
+    parser = add_model_config(parser)
+    parser = add_training_config(parser)
+    parser = add_output_config(parser)
+    parser = add_lora_config(parser)
+    parser = add_gradient_config(parser)
     parser = add_image_size_config(parser)
+
+    parser.add_argument("--sample_history_json", type=str, required=True, help="Path to sample_history.json used for both VLM conditioning and main training samples.")
+    parser.add_argument("--dataset_repeat", type=int, default=1, help="How many times to repeat records from sample_history.json per epoch.")
+    parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--history_prompt_mode", type=str, default="description", choices=["description", "empty"], help="How to form the diffusion prompt field from sample_history records.")
+
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
     parser.add_argument("--zero_cond_t", default=False, action="store_true", help="A special parameter introduced by Qwen-Image-Edit-2511. Please enable it for this model.")
@@ -128,27 +216,16 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
+
+    dataset = SampleHistoryDataset(
+        sample_history_json=args.sample_history_json,
         repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=UnifiedDataset.default_image_operator(
-            base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
-        ),
-        special_operator_map={
-            "layer_input_image": ToAbsolutePath(args.dataset_base_path) >> LoadImage(convert_RGB=False, convert_RGBA=True) >> ImageCropAndResize(args.height, args.width, args.max_pixels, 16, 16),
-            "image": RouteByType(operator_map=[
-                (str, ToAbsolutePath(args.dataset_base_path) >> LoadImage() >> ImageCropAndResize(args.height, args.width, args.max_pixels, 16, 16)),
-                (list, SequencialProcess(ToAbsolutePath(args.dataset_base_path) >> LoadImage(convert_RGB=False, convert_RGBA=True) >> ImageCropAndResize(args.height, args.width, args.max_pixels, 16, 16))),
-            ])
-        }
+        max_pixels=args.max_pixels,
+        height=args.height,
+        width=args.width,
+        prompt_mode=args.history_prompt_mode,
     )
+
     model = Qwen3VLMTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
