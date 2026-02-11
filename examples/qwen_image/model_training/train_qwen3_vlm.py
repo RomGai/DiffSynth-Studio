@@ -24,7 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class SampleHistoryDataset(torch.utils.data.Dataset):
-    """Training dataset built directly from sample_history.json."""
+    """Training dataset where JSON is used for VLM conditioning and PNG is supervision target."""
 
     def __init__(
         self,
@@ -34,6 +34,7 @@ class SampleHistoryDataset(torch.utils.data.Dataset):
         height: int | None = None,
         width: int | None = None,
         prompt_mode: str = "description",
+        target_image_path: str | None = None,
     ):
         self.sample_history_json = str(sample_history_json)
         self.repeat = repeat
@@ -46,24 +47,28 @@ class SampleHistoryDataset(torch.utils.data.Dataset):
         if not isinstance(records, list) or len(records) == 0:
             raise ValueError("sample_history.json must be a non-empty list.")
 
-        self.items = []
+        supervision_image_path = Path(target_image_path) if target_image_path is not None else history_path.with_suffix(".png")
+        if not supervision_image_path.is_absolute():
+            supervision_image_path = history_path.parent / supervision_image_path
+        if not supervision_image_path.exists():
+            raise FileNotFoundError(
+                f"Supervision image not found: {supervision_image_path}. "
+                "Please provide --target_image_path or place a same-name .png next to sample_history.json."
+            )
+
         image_processor = ImageCropAndResize(height, width, max_pixels, 16, 16)
-        for record in records:
-            image_path = record.get("image")
-            description = record.get("description", "")
-            if image_path is None:
-                raise ValueError("Each record in sample_history.json must contain an 'image' field.")
-            image_file = Path(image_path)
-            if not image_file.is_absolute():
-                image_file = history_path.parent / image_file
-            image = Image.open(image_file).convert("RGB")
-            image = image_processor(image)
-            prompt = description if prompt_mode == "description" else ""
-            self.items.append({
-                "image": image,
-                "prompt": prompt,
-                "qwen3_history_json": self.sample_history_json,
-            })
+        image = Image.open(supervision_image_path).convert("RGB")
+        image = image_processor(image)
+
+        prompt = ""
+        if prompt_mode == "description":
+            prompt = "\n".join([str(record.get("description", "")) for record in records]).strip()
+
+        self.items = [{
+            "image": image,
+            "prompt": prompt,
+            "qwen3_history_json": self.sample_history_json,
+        }]
 
     def __len__(self):
         return len(self.items) * self.repeat
@@ -194,10 +199,11 @@ def qwen3_vlm_parser():
     parser = add_gradient_config(parser)
     parser = add_image_size_config(parser)
 
-    parser.add_argument("--sample_history_json", type=str, required=True, help="Path to sample_history.json used for both VLM conditioning and main training samples.")
+    parser.add_argument("--sample_history_json", type=str, required=True, help="Path to sample_history.json used for VLM conditioning.")
+    parser.add_argument("--target_image_path", type=str, default=None, help="Supervision image path for diffusion training. If omitted, use <sample_history_json_basename>.png.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="How many times to repeat records from sample_history.json per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
-    parser.add_argument("--history_prompt_mode", type=str, default="description", choices=["description", "empty"], help="How to form the diffusion prompt field from sample_history records.")
+    parser.add_argument("--history_prompt_mode", type=str, default="description", choices=["description", "empty"], help="How to form the diffusion prompt from descriptions in sample_history.json.")
 
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
@@ -224,6 +230,7 @@ if __name__ == "__main__":
         height=args.height,
         width=args.width,
         prompt_mode=args.history_prompt_mode,
+        target_image_path=args.target_image_path,
     )
 
     model = Qwen3VLMTrainingModule(
