@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import copy
 from pathlib import Path
 
 import accelerate
@@ -157,6 +158,17 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
 
+    def set_trainable_models(self, trainable_models: str | None, keep_lora_for_model: str | None = None):
+        model_names = [] if trainable_models is None or trainable_models == "" else trainable_models.split(",")
+        self.pipe.freeze_except(model_names)
+        if keep_lora_for_model is not None and hasattr(self.pipe, keep_lora_for_model):
+            model = getattr(self.pipe, keep_lora_for_model)
+            if model is not None:
+                model.train()
+                for name, param in model.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad_(True)
+
     def get_pipeline_inputs(self, data):
         inputs_posi = {"prompt": data.get("prompt", "")}
         inputs_nega = {"negative_prompt": ""}
@@ -212,7 +224,53 @@ def qwen3_vlm_parser():
     parser.add_argument("--qwen3_model_name_or_path", type=str, default=None, help="Qwen3-VL model id or path.")
     parser.add_argument("--qwen3_max_length", type=int, default=640, help="Max length of Qwen3-VL embeddings.")
     parser.add_argument("--qwen3_attn_implementation", type=str, default=None, help="Optional attention implementation for Qwen3-VL.")
+
+    parser.add_argument("--enable_two_phase", default=False, action="store_true", help="Enable automatic two-phase training schedule.")
+    parser.add_argument("--phase1_num_epochs", type=int, default=0, help="Epochs for phase-1 training. If <=0, phase-1 is skipped.")
+    parser.add_argument("--phase1_trainable_models", type=str, default="qwen3_connector", help="Trainable models in phase-1.")
+    parser.add_argument("--phase1_learning_rate", type=float, default=None, help="Optional phase-1 learning rate override.")
+    parser.add_argument("--phase2_num_epochs", type=int, default=None, help="Epochs for phase-2 training. If None, uses --num_epochs.")
+    parser.add_argument("--phase2_trainable_models", type=str, default="dit,qwen3_connector", help="Trainable models in phase-2.")
+    parser.add_argument("--phase2_learning_rate", type=float, default=None, help="Optional phase-2 learning rate override.")
     return parser
+
+
+def run_two_phase_training(accelerator, dataset, model, args):
+    if args.phase1_num_epochs > 0:
+        phase1_args = copy.deepcopy(args)
+        phase1_args.num_epochs = args.phase1_num_epochs
+        phase1_args.trainable_models = args.phase1_trainable_models
+        if args.phase1_learning_rate is not None:
+            phase1_args.learning_rate = args.phase1_learning_rate
+        model.set_trainable_models(phase1_args.trainable_models)
+        phase1_logger = ModelLogger(
+            os.path.join(args.output_path, "phase1"),
+            remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        )
+        print(f"[TwoPhase] Phase-1: epochs={phase1_args.num_epochs}, trainable={phase1_args.trainable_models}, lr={phase1_args.learning_rate}")
+        launch_training_task(accelerator, dataset, model, phase1_logger, args=phase1_args)
+
+    phase2_args = copy.deepcopy(args)
+    phase2_args.num_epochs = args.num_epochs if args.phase2_num_epochs is None else args.phase2_num_epochs
+    phase2_args.trainable_models = args.phase2_trainable_models
+    if args.phase2_learning_rate is not None:
+        phase2_args.learning_rate = args.phase2_learning_rate
+
+    phase2_model_names = [] if phase2_args.trainable_models is None or phase2_args.trainable_models == "" else phase2_args.trainable_models.split(",")
+    keep_lora_for_model = None
+    if phase2_args.lora_base_model is not None and phase2_args.lora_base_model in phase2_model_names:
+        phase2_model_names = [name for name in phase2_model_names if name != phase2_args.lora_base_model]
+        keep_lora_for_model = phase2_args.lora_base_model
+        phase2_args.trainable_models = ",".join(phase2_model_names)
+        print(f"[TwoPhase] Detected LoRA base model '{keep_lora_for_model}'. Phase-2 will train LoRA params instead of full-parameter '{keep_lora_for_model}'.")
+
+    model.set_trainable_models(phase2_args.trainable_models, keep_lora_for_model=keep_lora_for_model)
+    phase2_logger = ModelLogger(
+        os.path.join(args.output_path, "phase2" if args.phase1_num_epochs > 0 else ""),
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+    )
+    print(f"[TwoPhase] Phase-2: epochs={phase2_args.num_epochs}, trainable={phase2_args.trainable_models}, lr={phase2_args.learning_rate}")
+    launch_training_task(accelerator, dataset, model, phase2_logger, args=phase2_args)
 
 
 if __name__ == "__main__":
@@ -269,4 +327,7 @@ if __name__ == "__main__":
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    if args.enable_two_phase and args.task in ("sft", "sft:train"):
+        run_two_phase_training(accelerator, dataset, model, args)
+    else:
+        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
