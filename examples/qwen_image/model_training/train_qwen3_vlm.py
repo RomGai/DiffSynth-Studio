@@ -157,17 +157,6 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
 
-    def set_trainable_models(self, trainable_models: str | None, keep_lora_for_model: str | None = None):
-        model_names = [] if trainable_models is None or trainable_models == "" else trainable_models.split(",")
-        self.pipe.freeze_except(model_names)
-        if keep_lora_for_model is not None and hasattr(self.pipe, keep_lora_for_model):
-            model = getattr(self.pipe, keep_lora_for_model)
-            if model is not None:
-                model.train()
-                for name, param in model.named_parameters():
-                    if "lora_" in name:
-                        param.requires_grad_(True)
-
     def get_pipeline_inputs(self, data):
         inputs_posi = {"prompt": data.get("prompt", "")}
         inputs_nega = {"negative_prompt": ""}
@@ -223,45 +212,7 @@ def qwen3_vlm_parser():
     parser.add_argument("--qwen3_model_name_or_path", type=str, default=None, help="Qwen3-VL model id or path.")
     parser.add_argument("--qwen3_max_length", type=int, default=640, help="Max length of Qwen3-VL embeddings.")
     parser.add_argument("--qwen3_attn_implementation", type=str, default=None, help="Optional attention implementation for Qwen3-VL.")
-
-    parser.add_argument("--training_phase", type=str, default="single", choices=["single", "phase1", "phase2"], help="Run single stage training, or only phase1/phase2 in split runs.")
-    parser.add_argument("--phase1_num_epochs", type=int, default=0, help="Epochs for phase-1 profile.")
-    parser.add_argument("--phase1_trainable_models", type=str, default="qwen3_connector", help="Trainable models in phase-1 profile.")
-    parser.add_argument("--phase1_learning_rate", type=float, default=None, help="Optional phase-1 learning rate override.")
-    parser.add_argument("--phase2_num_epochs", type=int, default=None, help="Epochs for phase-2 profile. If None, uses --num_epochs.")
-    parser.add_argument("--phase2_trainable_models", type=str, default="dit,qwen3_connector", help="Trainable models in phase-2 profile.")
-    parser.add_argument("--phase2_learning_rate", type=float, default=None, help="Optional phase-2 learning rate override.")
     return parser
-
-
-def apply_training_phase(args):
-    if args.training_phase == "single":
-        return args
-
-    if args.training_phase == "phase1":
-        if args.phase1_num_epochs <= 0:
-            raise ValueError("--training_phase phase1 requires --phase1_num_epochs > 0")
-        args.num_epochs = args.phase1_num_epochs
-        args.trainable_models = args.phase1_trainable_models
-        if args.phase1_learning_rate is not None:
-            args.learning_rate = args.phase1_learning_rate
-        args.output_path = os.path.join(args.output_path, "phase1")
-        return args
-
-    # phase2
-    args.num_epochs = args.num_epochs if args.phase2_num_epochs is None else args.phase2_num_epochs
-    args.trainable_models = args.phase2_trainable_models
-    if args.phase2_learning_rate is not None:
-        args.learning_rate = args.phase2_learning_rate
-
-    phase2_models = [] if args.trainable_models is None or args.trainable_models == "" else args.trainable_models.split(",")
-    if args.lora_base_model is not None and args.lora_base_model in phase2_models:
-        phase2_models = [name for name in phase2_models if name != args.lora_base_model]
-        args.trainable_models = ",".join(phase2_models)
-        print(f"[Phase2] LoRA base model '{args.lora_base_model}' detected. Running LoRA-only on that model (not full-parameter).")
-
-    args.output_path = os.path.join(args.output_path, "phase2")
-    return args
 
 
 if __name__ == "__main__":
@@ -318,5 +269,4 @@ if __name__ == "__main__":
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }
-    args = apply_training_phase(args)
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
