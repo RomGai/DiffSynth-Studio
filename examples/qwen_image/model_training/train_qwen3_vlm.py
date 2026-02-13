@@ -1,13 +1,11 @@
 import argparse
 import json
 import os
-import copy
 from pathlib import Path
 
 import accelerate
 import torch
 from PIL import Image
-from tqdm import tqdm
 
 from diffsynth.core.data.operators import ImageCropAndResize
 from diffsynth.diffusion import *
@@ -226,118 +224,44 @@ def qwen3_vlm_parser():
     parser.add_argument("--qwen3_max_length", type=int, default=640, help="Max length of Qwen3-VL embeddings.")
     parser.add_argument("--qwen3_attn_implementation", type=str, default=None, help="Optional attention implementation for Qwen3-VL.")
 
-    parser.add_argument("--enable_two_phase", default=False, action="store_true", help="Enable automatic two-phase training schedule.")
-    parser.add_argument("--phase1_num_epochs", type=int, default=0, help="Epochs for phase-1 training. If <=0, phase-1 is skipped.")
-    parser.add_argument("--phase1_trainable_models", type=str, default="qwen3_connector", help="Trainable models in phase-1.")
+    parser.add_argument("--training_phase", type=str, default="single", choices=["single", "phase1", "phase2"], help="Run single stage training, or only phase1/phase2 in split runs.")
+    parser.add_argument("--phase1_num_epochs", type=int, default=0, help="Epochs for phase-1 profile.")
+    parser.add_argument("--phase1_trainable_models", type=str, default="qwen3_connector", help="Trainable models in phase-1 profile.")
     parser.add_argument("--phase1_learning_rate", type=float, default=None, help="Optional phase-1 learning rate override.")
-    parser.add_argument("--phase2_num_epochs", type=int, default=None, help="Epochs for phase-2 training. If None, uses --num_epochs.")
-    parser.add_argument("--phase2_trainable_models", type=str, default="dit,qwen3_connector", help="Trainable models in phase-2.")
+    parser.add_argument("--phase2_num_epochs", type=int, default=None, help="Epochs for phase-2 profile. If None, uses --num_epochs.")
+    parser.add_argument("--phase2_trainable_models", type=str, default="dit,qwen3_connector", help="Trainable models in phase-2 profile.")
     parser.add_argument("--phase2_learning_rate", type=float, default=None, help="Optional phase-2 learning rate override.")
     return parser
 
 
-def _parse_model_names(trainable_models: str | None):
-    if trainable_models is None or trainable_models == "":
-        return []
-    return [name for name in trainable_models.split(",") if name]
+def apply_training_phase(args):
+    if args.training_phase == "single":
+        return args
 
+    if args.training_phase == "phase1":
+        if args.phase1_num_epochs <= 0:
+            raise ValueError("--training_phase phase1 requires --phase1_num_epochs > 0")
+        args.num_epochs = args.phase1_num_epochs
+        args.trainable_models = args.phase1_trainable_models
+        if args.phase1_learning_rate is not None:
+            args.learning_rate = args.phase1_learning_rate
+        args.output_path = os.path.join(args.output_path, "phase1")
+        return args
 
-def _is_param_active(name: str, active_models: list[str], lora_only_model: str | None = None):
-    for model_name in active_models:
-        prefix = f"pipe.{model_name}"
-        if name.startswith(prefix):
-            if lora_only_model is not None and model_name == lora_only_model:
-                return "lora_" in name
-            return True
-    return False
+    # phase2
+    args.num_epochs = args.num_epochs if args.phase2_num_epochs is None else args.phase2_num_epochs
+    args.trainable_models = args.phase2_trainable_models
+    if args.phase2_learning_rate is not None:
+        args.learning_rate = args.phase2_learning_rate
 
+    phase2_models = [] if args.trainable_models is None or args.trainable_models == "" else args.trainable_models.split(",")
+    if args.lora_base_model is not None and args.lora_base_model in phase2_models:
+        phase2_models = [name for name in phase2_models if name != args.lora_base_model]
+        args.trainable_models = ",".join(phase2_models)
+        print(f"[Phase2] LoRA base model '{args.lora_base_model}' detected. Running LoRA-only on that model (not full-parameter).")
 
-def run_two_phase_training(accelerator, dataset, model, args):
-    phase1_models = _parse_model_names(args.phase1_trainable_models)
-    phase2_models = _parse_model_names(args.phase2_trainable_models)
-    union_models = sorted(set(phase1_models + phase2_models))
-
-    keep_lora_for_union = args.lora_base_model if args.lora_base_model in union_models else None
-    model.set_trainable_models(",".join(union_models), keep_lora_for_model=keep_lora_for_union)
-
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        shuffle=True,
-        collate_fn=lambda x: x[0],
-        num_workers=args.dataset_num_workers,
-    )
-
-    model.to(device=accelerator.device)
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
-
-    phases = []
-    if args.phase1_num_epochs > 0:
-        phases.append({
-            "name": "phase1",
-            "num_epochs": args.phase1_num_epochs,
-            "active_models": phase1_models,
-            "lr": args.phase1_learning_rate if args.phase1_learning_rate is not None else args.learning_rate,
-            "lora_only_model": None,
-            "logger": ModelLogger(
-                os.path.join(args.output_path, "phase1"),
-                remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-            ),
-        })
-
-    phase2_epochs = args.num_epochs if args.phase2_num_epochs is None else args.phase2_num_epochs
-    phase2_lora_only_model = args.lora_base_model if args.lora_base_model in phase2_models else None
-    phases.append({
-        "name": "phase2",
-        "num_epochs": phase2_epochs,
-        "active_models": phase2_models,
-        "lr": args.phase2_learning_rate if args.phase2_learning_rate is not None else args.learning_rate,
-        "lora_only_model": phase2_lora_only_model,
-        "logger": ModelLogger(
-            os.path.join(args.output_path, "phase2" if args.phase1_num_epochs > 0 else ""),
-            remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-        ),
-    })
-
-    for phase in phases:
-        for group in optimizer.param_groups:
-            group["lr"] = phase["lr"]
-        print(
-            f"[TwoPhase] {phase['name']}: epochs={phase['num_epochs']}, "
-            f"trainable={','.join(phase['active_models'])}, lr={phase['lr']}, "
-            f"lora_only_model={phase['lora_only_model']}"
-        )
-
-        for epoch_id in range(phase["num_epochs"]):
-            for data in tqdm(dataloader):
-                with accelerator.accumulate(model):
-                    optimizer.zero_grad()
-                    if dataset.load_from_cache:
-                        loss = model({}, inputs=data)
-                    else:
-                        loss = model(data)
-                    accelerator.backward(loss)
-
-                    unwrapped = accelerator.unwrap_model(model)
-                    for param_name, param in unwrapped.named_parameters():
-                        if param.grad is None:
-                            continue
-                        if not _is_param_active(
-                            param_name,
-                            phase["active_models"],
-                            lora_only_model=phase["lora_only_model"],
-                        ):
-                            param.grad = None
-
-                    optimizer.step()
-                    phase["logger"].on_step_end(accelerator, model, args.save_steps, loss=loss)
-                    scheduler.step()
-
-            if args.save_steps is None:
-                phase["logger"].on_epoch_end(accelerator, model, epoch_id)
-
-        phase["logger"].on_training_end(accelerator, model, args.save_steps)
+    args.output_path = os.path.join(args.output_path, "phase2")
+    return args
 
 
 if __name__ == "__main__":
@@ -394,7 +318,5 @@ if __name__ == "__main__":
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }
-    if args.enable_two_phase and args.task in ("sft", "sft:train"):
-        run_two_phase_training(accelerator, dataset, model, args)
-    else:
-        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    args = apply_training_phase(args)
+    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
