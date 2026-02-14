@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from diffsynth.core.data.operators import ImageCropAndResize
+from diffsynth.core import load_state_dict
 from diffsynth.diffusion import *
 from diffsynth.diffusion.parsers import (
     add_gradient_config,
@@ -102,6 +103,7 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
         qwen3_model_name_or_path=None,
         qwen3_max_length=640,
         qwen3_attn_implementation=None,
+        connector_checkpoint=None,
     ):
         super().__init__()
         model_configs = self.parse_model_configs(
@@ -126,6 +128,8 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
             attn_implementation=qwen3_attn_implementation,
         )
         self.pipe.enable_qwen3_conditioning(config=qwen3_config)
+        if connector_checkpoint is not None:
+            self.load_connector_checkpoint(self.pipe, connector_checkpoint)
         if trainable_models is None:
             trainable_models = "dit,qwen3_connector"
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
@@ -156,6 +160,23 @@ class Qwen3VLMTrainingModule(DiffusionTrainingModule):
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
+
+    def load_connector_checkpoint(self, pipe, connector_checkpoint):
+        state_dict = load_state_dict(connector_checkpoint)
+        connector_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("pipe.qwen3_connector."):
+                connector_state_dict[key[len("pipe.qwen3_connector."):]] = value
+            elif key.startswith("qwen3_connector."):
+                connector_state_dict[key[len("qwen3_connector."):]] = value
+            else:
+                connector_state_dict[key] = value
+        load_result = pipe.qwen3_connector.load_state_dict(connector_state_dict, strict=False)
+        print(f"Connector checkpoint loaded: {connector_checkpoint}, total {len(connector_state_dict)} keys")
+        if len(load_result[0]) > 0:
+            print(f"Warning, missing connector keys: {load_result[0]}")
+        if len(load_result[1]) > 0:
+            print(f"Warning, unexpected connector keys: {load_result[1]}")
 
     def get_pipeline_inputs(self, data):
         inputs_posi = {"prompt": data.get("prompt", "")}
@@ -212,6 +233,7 @@ def qwen3_vlm_parser():
     parser.add_argument("--qwen3_model_name_or_path", type=str, default=None, help="Qwen3-VL model id or path.")
     parser.add_argument("--qwen3_max_length", type=int, default=640, help="Max length of Qwen3-VL embeddings.")
     parser.add_argument("--qwen3_attn_implementation", type=str, default=None, help="Optional attention implementation for Qwen3-VL.")
+    parser.add_argument("--connector_checkpoint", type=str, default=None, help="Path to a trained connector checkpoint. Supports state dict with or without `pipe.qwen3_connector.` prefix.")
     return parser
 
 
@@ -256,6 +278,7 @@ if __name__ == "__main__":
         qwen3_model_name_or_path=args.qwen3_model_name_or_path,
         qwen3_max_length=args.qwen3_max_length,
         qwen3_attn_implementation=args.qwen3_attn_implementation,
+        connector_checkpoint=args.connector_checkpoint,
     )
     model_logger = ModelLogger(
         args.output_path,
