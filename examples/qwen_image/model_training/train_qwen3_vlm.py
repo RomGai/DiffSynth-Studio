@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from diffsynth.core.data.operators import ImageCropAndResize
+from diffsynth.core import load_state_dict
 from diffsynth.diffusion import *
 from diffsynth.diffusion.parsers import (
     add_gradient_config,
