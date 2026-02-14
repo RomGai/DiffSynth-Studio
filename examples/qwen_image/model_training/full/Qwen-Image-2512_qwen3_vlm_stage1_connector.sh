@@ -13,7 +13,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch \
   --max_pixels 1048576 \
   --dataset_repeat 2 \
   --model_id_with_origin_paths "Qwen/Qwen-Image-2512:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors" \
-  --learning_rate 1e-4 \
+  --learning_rate 3e-5 \
   --num_epochs 1 \
   --trainable_models "qwen3_connector" \
   --remove_prefix_in_ckpt "pipe.qwen3_connector." \
