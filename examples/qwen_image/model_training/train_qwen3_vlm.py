@@ -18,6 +18,7 @@ from diffsynth.diffusion.parsers import (
     add_output_config,
     add_training_config,
 )
+from diffsynth.diffusion.runner import launch_data_process_task
 from diffsynth.pipelines.qwen_image import ModelConfig, QwenImagePipeline
 from qwen3_pipeline import Qwen3VLPipelineConfig
 
@@ -221,7 +222,9 @@ def qwen3_vlm_parser():
     parser = add_image_size_config(parser)
 
     parser.add_argument("--sample_history_json", type=str, required=True, help="Path to sample_history.json used for VLM conditioning.")
+    parser.add_argument("--val_sample_history_json", type=str, default=None, help="Path to validation sample_history.json used for epoch-end inference validation. Defaults to --sample_history_json.")
     parser.add_argument("--target_image_path", type=str, default=None, help="Supervision image path for diffusion training. If omitted, use <sample_history_json_basename>.png.")
+    parser.add_argument("--val_target_image_path", type=str, default=None, help="Validation supervision image path (used only for consistent preprocessing metadata). Defaults to --target_image_path.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="How many times to repeat records from sample_history.json per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--history_prompt_mode", type=str, default="description", choices=["description", "empty"], help="How to form the diffusion prompt from descriptions in sample_history.json.")
@@ -234,7 +237,70 @@ def qwen3_vlm_parser():
     parser.add_argument("--qwen3_max_length", type=int, default=640, help="Max length of Qwen3-VL embeddings.")
     parser.add_argument("--qwen3_attn_implementation", type=str, default=None, help="Optional attention implementation for Qwen3-VL.")
     parser.add_argument("--connector_checkpoint", type=str, default=None, help="Path to a trained connector checkpoint. Supports state dict with or without `pipe.qwen3_connector.` prefix.")
+    parser.add_argument("--val_num_inference_steps", type=int, default=20, help="Number of inference steps for each epoch-end validation image.")
+    parser.add_argument("--val_seed", type=int, default=0, help="Seed for epoch-end validation inference.")
     return parser
+
+
+def launch_training_task_with_validation(accelerator, dataset, val_dataset, model, model_logger, args):
+    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=args.dataset_num_workers)
+    model.to(device=accelerator.device)
+    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+
+    val_sample = val_dataset[0]
+    val_dir = Path(model_logger.output_path) / "validation"
+    val_dir.mkdir(parents=True, exist_ok=True)
+
+    global_step = 0
+    for epoch_id in range(args.num_epochs):
+        for step_id, data in enumerate(dataloader):
+            with accelerator.accumulate(model):
+                optimizer.zero_grad()
+                if dataset.load_from_cache:
+                    loss = model({}, inputs=data)
+                else:
+                    loss = model(data)
+                accelerator.backward(loss)
+                optimizer.step()
+                model_logger.on_step_end(accelerator, model, args.save_steps, loss=loss)
+                scheduler.step()
+
+                if accelerator.is_local_main_process:
+                    print(
+                        f"[Train] epoch={epoch_id + 1}/{args.num_epochs}, "
+                        f"step={step_id + 1}, global_step={global_step + 1}, "
+                        f"loss={loss.detach().float().item():.6f}"
+                    )
+                global_step += 1
+
+        if args.save_steps is None:
+            model_logger.on_epoch_end(accelerator, model, epoch_id)
+
+        unwrapped_model = accelerator.unwrap_model(model)
+        was_training = unwrapped_model.training
+        unwrapped_model.eval()
+        with torch.no_grad():
+            val_image = unwrapped_model.pipe(
+                prompt=val_sample.get("prompt", ""),
+                qwen3_history_json=val_sample["qwen3_history_json"],
+                height=val_sample["image"].size[1],
+                width=val_sample["image"].size[0],
+                cfg_scale=1,
+                num_inference_steps=args.val_num_inference_steps,
+                seed=args.val_seed,
+                rand_device=str(unwrapped_model.pipe.device),
+            )
+        if was_training:
+            unwrapped_model.train()
+
+        if accelerator.is_local_main_process:
+            val_image_path = val_dir / f"epoch_{epoch_id + 1:03d}.png"
+            val_image.save(val_image_path)
+            print(f"[Validation] epoch={epoch_id + 1}/{args.num_epochs}, image_saved={val_image_path}")
+
+    model_logger.on_training_end(accelerator, model, args.save_steps)
 
 
 if __name__ == "__main__":
@@ -253,6 +319,15 @@ if __name__ == "__main__":
         width=args.width,
         prompt_mode=args.history_prompt_mode,
         target_image_path=args.target_image_path,
+    )
+    val_dataset = SampleHistoryDataset(
+        sample_history_json=args.val_sample_history_json or args.sample_history_json,
+        repeat=1,
+        max_pixels=args.max_pixels,
+        height=args.height,
+        width=args.width,
+        prompt_mode=args.history_prompt_mode,
+        target_image_path=args.val_target_image_path or args.target_image_path,
     )
 
     model = Qwen3VLMTrainingModule(
@@ -287,9 +362,12 @@ if __name__ == "__main__":
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
-        "sft": launch_training_task,
-        "sft:train": launch_training_task,
-        "direct_distill": launch_training_task,
-        "direct_distill:train": launch_training_task,
+        "sft": launch_training_task_with_validation,
+        "sft:train": launch_training_task_with_validation,
+        "direct_distill": launch_training_task_with_validation,
+        "direct_distill:train": launch_training_task_with_validation,
     }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    if args.task in ["sft:data_process", "direct_distill:data_process"]:
+        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    else:
+        launcher_map[args.task](accelerator, dataset, val_dataset, model, model_logger, args)
